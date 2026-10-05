@@ -2,6 +2,7 @@ import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
 import { SpecStore } from './store';
+import { STATUS_LABEL, isUnresolved, describeChange, describeOrigin, type DependencyRef } from './ledger';
 import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
@@ -24,6 +25,13 @@ export class SpecA11yWorkbench extends LitElement {
   private toast = '';
   private showValidation = true;
   private toastTimer?: number;
+  /** 属性改名草稿（属性 id -> 输入值）；失焦/回车时才提交改名，避免逐字符记录 */
+  private renameDrafts = new Map<string, string>();
+  /** 正在确认移除的属性 id（展示接替属性选择） */
+  private removingPropertyId = '';
+  private removingSuccessor = '';
+  /** 新增组合依赖的草稿 */
+  private composeTarget = new Map<string, string>();
 
   static styles = css`
     :host {
@@ -116,9 +124,29 @@ export class SpecA11yWorkbench extends LitElement {
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
+    .pending-count { color: var(--spectrum-red-700); font-weight: 700; }
+    .ref-list { display: grid; gap: 8px; margin: 10px 0; }
+    .ref-chip { border: 1px solid var(--spectrum-gray-300); border-radius: 10px; padding: 10px 12px; background: var(--spectrum-gray-100); display: grid; gap: 6px; }
+    .ref-chip.unresolved { border-color: var(--spectrum-orange-600); background: var(--spectrum-orange-200); }
+    .ref-chip-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+    .ref-chip-head strong { flex: 1; min-width: 160px; }
+    .ref-pin { color: var(--spectrum-gray-700); font-size: 11px; }
+    .ref-reason { font-size: 12px; color: var(--spectrum-gray-900); }
+    .ref-actions { flex-wrap: wrap; }
+    .ref-detail { font-size: 11px; color: var(--spectrum-gray-700); }
+    .ref-provenance { font-size: 11px; color: var(--spectrum-gray-700); }
+    .ref-provenance ul { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 3px; }
+    .ledger-section { display: grid; gap: 8px; margin: 8px 0 16px; }
+    .ledger-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .ledger-subhead { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--spectrum-gray-700); margin: 6px 0; }
+    .ledger-row { border: 1px solid var(--spectrum-gray-300); border-radius: 8px; padding: 9px 10px; margin-bottom: 8px; display: grid; gap: 3px; background: var(--spectrum-gray-75, var(--spectrum-gray-100)); }
+    .ledger-meta { font-size: 11px; color: var(--spectrum-gray-700); }
+    .ledger-detail { font-size: 11px; color: var(--spectrum-gray-800); white-space: pre-wrap; }
+    .blocker-list { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 3px; }
     @media (max-width: 1180px) {
       .layout { grid-template-columns: 230px minmax(0, 1fr); }
       .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--spectrum-gray-300); grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .ledger-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 760px) {
       header { flex-wrap: wrap; padding: 12px; }
@@ -160,8 +188,9 @@ export class SpecA11yWorkbench extends LitElement {
     }
     if (modifier && event.key.toLowerCase() === 's') {
       event.preventDefault();
-      this.store.createSnapshot('键盘保存');
-      this.flash('已创建版本快照');
+      const result = this.store.createSnapshot('键盘保存');
+      if (result.ok) this.flash('正式版本已保存');
+      else this.flash(result.reason?.split('\n')[0] ?? '待整理项未处理完，不能保存正式版本');
       return;
     }
     if (modifier && event.key.toLowerCase() === 'k') {
@@ -203,8 +232,8 @@ export class SpecA11yWorkbench extends LitElement {
               ></sp-search>
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
-              <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
-              <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
+              <sp-button variant="accent" @click=${() => this.saveVersion('工具栏保存')}>保存版本</sp-button>
+              <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版${this.totalPending() ? html` · ${this.totalPending()} 项待整理` : nothing}</span>
             </div>
           </header>
           <div class="layout">
@@ -220,7 +249,7 @@ export class SpecA11yWorkbench extends LitElement {
                       <span>${item.name}</span>
                       <span class="pill ${item.status}">${this.statusLabel(item.status)}</span>
                     </span>
-                    <span class="item-meta">${item.category} · ${item.properties.length} 个属性 · ${item.examples.length} 个示例</span>
+                    <span class="item-meta">${item.category} · ${item.properties.length} 个属性 · ${item.examples.length} 个示例${this.pendingForComponent(item.id) ? html` · <strong class="pending-count">${this.pendingForComponent(item.id)} 项待整理</strong>` : nothing}</span>
                   </button>
                 `) : html`<div class="search-empty">没有匹配的组件。可尝试属性名、键盘行为或代码文本。</div>`}
               </div>
@@ -251,8 +280,9 @@ export class SpecA11yWorkbench extends LitElement {
             <option value="review">待审</option>
             <option value="published">已发布</option>
           </select>
-          <sp-button variant="secondary" @click=${() => this.store.createSnapshot('编辑器保存')}>保存快照</sp-button>
+          <sp-button variant="secondary" @click=${() => this.store.migrateExamples()}>重算引用</sp-button>
           ${this.hasStaleExamples(component) ? html`<sp-button variant="accent" @click=${() => { this.store.migrateExamples(); this.flash('示例已迁移到当前契约'); }}>迁移示例</sp-button>` : nothing}
+          <sp-button variant="accent" ?disabled=${this.store.saveBlockers(component.id).length > 0} @click=${() => this.saveVersion('编辑器保存')}>保存正式版本</sp-button>
         </div>
       </div>
       <div class="tabs" role="tablist" aria-label="编辑区域">
@@ -296,7 +326,7 @@ export class SpecA11yWorkbench extends LitElement {
           <sp-button size="s" variant="secondary" @click=${() => this.store.addProperty()}>新增属性</sp-button>
         </div>
         <div class="property-list">
-          ${component.properties.length ? repeat(component.properties, (item) => item.id, (property) => this.renderProperty(property)) : html`<div class="empty">尚未定义属性。</div>`}
+          ${component.properties.length ? repeat(component.properties, (item) => item.id, (property) => this.renderProperty(component, property)) : html`<div class="empty">尚未定义属性。</div>`}
         </div>
         <div class="form-grid" style="margin-top: 18px">
           <label class="field full"><span>状态说明</span><textarea .value=${component.states} @change=${(event: Event) => this.store.updateComponent({ states: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
@@ -306,15 +336,26 @@ export class SpecA11yWorkbench extends LitElement {
     `;
   }
 
-  private renderProperty(property: PropertySpec): TemplateResult {
+  private renderProperty(component: ComponentSpec, property: PropertySpec): TemplateResult {
+    const removing = this.removingPropertyId === property.id;
     return html`
       <article class="property-card">
         <div class="property-head">
           <strong>${property.name || '未命名属性'}</strong>
-          <sp-action-button size="s" label="删除属性" @click=${() => this.store.removeProperty(property.id)}>删除</sp-action-button>
+          ${removing
+            ? html`
+              <div class="inline">
+                <select aria-label="接替属性" .value=${this.removingSuccessor} @change=${(event: Event) => { this.removingSuccessor = (event.currentTarget as HTMLSelectElement).value; }}>
+                  <option value="">无接替（引用只能删除）</option>
+                  ${component.properties.filter((item) => item.id !== property.id).map((item) => html`<option value=${item.name}>由 ${item.name} 接替</option>`)}
+                </select>
+                <sp-button size="s" variant="accent" @click=${() => { this.store.removeProperty(property.id, this.removingSuccessor || null); this.cancelRemove(); this.flash(`属性 ${property.name} 已移除，引用已沿链重算`); }}>确认移除</sp-button>
+                <sp-action-button size="s" label="取消移除" @click=${this.cancelRemove}>取消</sp-action-button>
+              </div>`
+            : html`<sp-action-button size="s" label="删除属性" @click=${() => this.startRemove(property.id)}>删除</sp-action-button>`}
         </div>
         <div class="form-grid">
-          <label class="field"><span>名称</span><input type="text" .value=${property.name} @change=${(event: Event) => this.store.updateProperty(property.id, { name: (event.currentTarget as HTMLInputElement).value })} /></label>
+          <label class="field"><span>名称（改名会记录到依赖账本并沿引用链失效重算）</span><input type="text" .value=${this.renameDrafts.get(property.id) ?? property.name} @input=${(event: Event) => { this.renameDrafts.set(property.id, (event.currentTarget as HTMLInputElement).value); }} @change=${() => this.commitRename(property.id)} @keydown=${(event: KeyboardEvent) => { if (event.key === 'Enter') { event.preventDefault(); (event.currentTarget as HTMLInputElement).blur(); } }} /></label>
           <label class="field"><span>类型</span><input type="text" .value=${property.type} @change=${(event: Event) => this.store.updateProperty(property.id, { type: (event.currentTarget as HTMLInputElement).value })} /></label>
           <label class="field"><span>默认值</span><input type="text" .value=${property.defaultValue} @change=${(event: Event) => this.store.updateProperty(property.id, { defaultValue: (event.currentTarget as HTMLInputElement).value })} /></label>
           <label class="inline"><input type="checkbox" .checked=${property.required} @change=${(event: Event) => this.store.updateProperty(property.id, { required: (event.currentTarget as HTMLInputElement).checked })} /> 必填属性</label>
@@ -328,10 +369,14 @@ export class SpecA11yWorkbench extends LitElement {
     return html`
       <section class="panel">
         <div class="form-grid">
-          <label class="field full"><span>键盘行为</span><textarea .value=${component.keyboardBehavior} @change=${(event: Event) => this.store.updateComponent({ keyboardBehavior: (event.currentTarget as HTMLTextAreaElement).value }, true)}></textarea></label>
-          <label class="field full"><span>读屏说明</span><textarea .value=${component.screenReader} @change=${(event: Event) => this.store.updateComponent({ screenReader: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
+          <label class="field full"><span>键盘行为（变化会提升契约版本，并沿引用链使组合示例与读屏说明失效）</span><textarea .value=${component.keyboardBehavior} @change=${(event: Event) => this.store.updateKeyboardBehavior((event.currentTarget as HTMLTextAreaElement).value)}></textarea></label>
+          <label class="field full"><span>读屏说明（文本中出现的关联组件属性名会自动登记为引用，改名后失效重算）</span><textarea .value=${component.screenReader} @change=${(event: Event) => this.store.updateComponent({ screenReader: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
           <label class="field full"><span>禁用场景</span><textarea .value=${component.disabledScenarios} @change=${(event: Event) => this.store.updateComponent({ disabledScenarios: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
         </div>
+        ${(() => {
+          const srRefs = this.store.state.ledger?.refs.filter((ref) => ref.ownerComponentId === component.id && ref.scope === 'screenReader') ?? [];
+          return srRefs.length ? html`<h3>读屏说明中的关联引用（${srRefs.length}）</h3><div class="ref-list">${srRefs.map((ref) => this.renderRefChip(ref))}</div>` : nothing;
+        })()}
       </section>
     `;
   }
@@ -351,20 +396,24 @@ export class SpecA11yWorkbench extends LitElement {
   }
 
   private renderExample(component: ComponentSpec, example: ComponentExample): TemplateResult {
+    const refs = this.refsFor(component.id, example.id);
+    const blocked = refs.some((ref) => isUnresolved(ref));
     return html`
       <article class="example-card">
         <div class="example-head">
           <strong>${example.title}</strong>
-          <span class="pill ${example.stale ? 'review' : 'published'}">${example.stale ? '需要迁移' : `r${example.createdFromRevision}`}</span>
-          <sp-action-button size="s" label="复制代码" @click=${() => this.copy(example.code)}>复制</sp-action-button>
+          <span class="pill ${example.stale || blocked ? 'review' : 'published'}">${blocked ? '引用失效·禁复制' : example.stale ? '需要迁移' : `r${example.createdFromRevision}`}</span>
+          <sp-action-button size="s" label="复制代码" ?disabled=${example.stale || blocked} @click=${() => this.copy(example.code)}>复制</sp-action-button>
           <sp-action-button size="s" label="删除示例" @click=${() => this.store.removeExample(example.id)}>删除</sp-action-button>
         </div>
         ${example.stale ? html`<div class="issue warning"><strong>关联失效</strong>${example.staleReason}</div>` : nothing}
+        ${blocked ? html`<div class="issue error"><strong>不能复制：引用链上有未处理的旧属性名/键盘契约</strong>在下方依赖区选定迁移或核对通过后才会解锁，避免发布出去的代码报错。</div>` : nothing}
+        ${refs.length ? html`<div class="ref-list">${refs.map((ref) => this.renderRefChip(ref))}</div>` : nothing}
         <div class="form-grid">
           <label class="field full"><span>标题</span><input type="text" .value=${example.title} @change=${(event: Event) => this.store.updateExample(example.id, { title: (event.currentTarget as HTMLInputElement).value })} /></label>
           <label class="field full"><span>代码</span><textarea .value=${example.code} @change=${(event: Event) => this.store.updateExample(example.id, { code: (event.currentTarget as HTMLTextAreaElement).value })}></textarea></label>
           <div class="field full">
-            <span>依赖属性</span>
+            <span>依赖属性（本组件）</span>
             <div class="inline" style="flex-wrap: wrap">
               ${component.properties.map((property) => html`
                 <label class="inline"><input type="checkbox" .checked=${example.propertyIds.includes(property.id)} @change=${(event: Event) => {
@@ -376,27 +425,118 @@ export class SpecA11yWorkbench extends LitElement {
               ${!component.properties.length ? html`<span>当前组件没有属性。</span>` : nothing}
             </div>
           </div>
+          ${this.renderCompositionPicker(component, example)}
           <div class="field full"><pre>${example.code}</pre></div>
         </div>
       </article>
     `;
   }
 
+  /** 手动登记组合依赖：选择基础组件 + 属性 / 键盘契约 */
+  private renderCompositionPicker(component: ComponentSpec, example: ComponentExample): TemplateResult {
+    const others = this.store.state.components.filter((item) => item.id !== component.id && item.tagName);
+    const targetId = this.composeTarget.get(example.id) ?? others[0]?.id ?? '';
+    const target = this.store.state.components.find((item) => item.id === targetId);
+    return html`
+      <div class="field full">
+        <span>组合依赖（基础组件，保存进依赖账本）</span>
+        <div class="inline" style="flex-wrap: wrap">
+          <select aria-label="基础组件" .value=${targetId} @change=${(event: Event) => { this.composeTarget.set(example.id, (event.currentTarget as HTMLSelectElement).value); this.requestUpdate(); }}>
+            ${others.map((item) => html`<option value=${item.id}>${item.name}（${item.tagName}）</option>`)}
+          </select>
+          <sp-button size="s" variant="secondary" ?disabled=${!target} @click=${() => { if (target) { this.store.addCompositionRef(example.id, target.id, 'keyboard', '__keyboard__'); this.flash('已登记键盘契约依赖'); } }}>登记键盘契约</sp-button>
+          ${target?.properties.map((property) => html`
+            <sp-button size="s" variant="secondary" @click=${() => { this.store.addCompositionRef(example.id, target.id, 'property', property.name); this.flash(`已登记对 ${property.name} 的依赖`); }}>${property.name}</sp-button>
+          `)}
+        </div>
+      </div>
+    `;
+  }
+
+  private renderRefChip(ref: DependencyRef): TemplateResult {
+    const target = this.store.state.components.find((component) => component.id === ref.targetComponentId);
+    const token = ref.kind === 'keyboard' ? '键盘契约' : (ref.resolvedName === null ? `${ref.oldName}（已删引用）` : (ref.resolvedName ?? ref.oldName));
+    const unresolved = isUnresolved(ref);
+    return html`
+      <div class="ref-chip ${unresolved ? 'unresolved' : ''}">
+        <div class="ref-chip-head">
+          <strong>${target?.name ?? ref.targetComponentId} · ${token}</strong>
+          <span class="pill ${unresolved ? 'review' : 'published'}">${STATUS_LABEL[ref.status]}</span>
+          <span class="ref-pin">钉住 r${ref.pinnedRevision} / 当前 r${target?.revision ?? '?'}</span>
+          <sp-action-button size="s" label="移除引用记录" @click=${() => { this.store.removeLedgerRef(ref.id); this.flash('引用记录已移除'); }}>×</sp-action-button>
+        </div>
+        ${ref.pendingReason ? html`<div class="ref-reason">${ref.pendingReason}</div>` : nothing}
+        ${ref.candidates.length ? html`
+          <div class="inline ref-actions">
+            ${ref.candidates.map((candidate) => html`
+              <sp-button size="s" variant="accent" @click=${() => {
+                const result = this.store.chooseRefCandidate(ref.id, candidate.id);
+                if (result.ok) this.flash('已按选定方案迁移正式内容');
+                else this.flash(result.reason ?? '候选已失效');
+              }}>${candidate.label}</sp-button>
+            `)}
+          </div>
+          <div class="ref-detail">${ref.candidates.map((candidate) => candidate.detail).join(' / ')}</div>
+        ` : nothing}
+        ${ref.status === 'unverified' || ref.status === 'pendingVerify' ? html`
+          <div class="inline ref-actions"><sp-button size="s" variant="accent" @click=${() => { const result = this.store.verifyRef(ref.id); this.flash(result.ok ? '已核对，正在按改名记录重算' : (result.reason ?? '无需核对')); }}>核对通过并按映射重算</sp-button></div>
+        ` : nothing}
+        ${ref.provenance.length ? html`<details class="ref-provenance"><summary>迁移与核对来源（${ref.provenance.length}）</summary><ul>${ref.provenance.map((line) => html`<li>${line}</li>`)}</ul></details>` : nothing}
+      </div>
+    `;
+  }
+
   private renderHistory(component: ComponentSpec): TemplateResult {
     const snapshot = component.snapshots[0];
     const rows = diffAgainstSnapshot(component, snapshot);
+    const ledger = this.store.state.ledger;
+    const pendingRefs = this.pendingRefs(component.id);
+    const blockers = this.store.saveBlockers(component.id);
+    const componentChanges = ledger?.changes.filter((change) => change.componentId === component.id) ?? [];
     return html`
       <section class="panel">
         <div class="property-head">
-          <h2>版本与迁移</h2>
-          <sp-button size="s" variant="secondary" @click=${() => this.store.createSnapshot('历史面板保存')}>保存当前版本</sp-button>
+          <h2>依赖账本与正式版本</h2>
+          <div class="inline">
+            <sp-button size="s" variant="secondary" @click=${() => { this.store.migrateExamples(); this.flash('已沿引用链重新计算'); }}>重新检查引用</sp-button>
+            <sp-button size="s" variant="accent" ?disabled=${blockers.length > 0} @click=${() => this.saveVersion('历史面板保存')}>保存正式版本</sp-button>
+          </div>
         </div>
-        <p>当前为 r${component.revision}。最近快照：${snapshot ? `r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')}` : '暂无'}。</p>
-        ${snapshot ? html`
-          <h3>与最近快照的差异</h3>
-          ${rows.length ? html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${row.field}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>` : html`<div class="issue info">当前内容与最近快照一致。</div>`}
-        ` : html`<div class="empty">保存一次版本后即可比较字段、属性和示例变化。</div>`}
-        ${this.hasStaleExamples(component) ? html`<div class="issue warning" style="margin-top: 14px"><strong>检测到待迁移示例</strong>迁移会保留代码内容，清理已删除属性引用并更新契约版本。<br /><button @click=${() => this.store.migrateExamples()}>立即迁移</button></div>` : nothing}
+        <p>当前契约 r${component.revision}。最近快照：${snapshot ? `r${snapshot.revision} · ${new Date(snapshot.savedAt).toLocaleString('zh-CN')}` : '暂无'}。待整理项未处理完不能保存正式版本。</p>
+
+        ${blockers.length ? html`
+          <div class="issue error"><strong>保存被阻塞（${blockers.length} 项）</strong><ul class="blocker-list">${blockers.map((item) => html`<li>${item}</li>`)}</ul></div>
+        ` : html`<div class="issue info"><strong>可以保存正式版本</strong>待整理项、失效示例与检查错误均已清零。</div>`}
+
+        <h3>待整理（${pendingRefs.length}）</h3>
+        ${pendingRefs.length
+          ? html`<div class="ledger-section">${repeat(pendingRefs, (ref) => ref.id, (ref) => this.renderRefChip(ref))}</div>`
+          : html`<div class="issue info">该组件的读屏说明与组合示例没有待核对、待选定或不兼容的引用。</div>`}
+
+        <h3>改动来源与引用关系</h3>
+        ${ledger ? html`
+          <div class="ledger-grid">
+            <div>
+              <div class="ledger-subhead">本组件契约改动（${componentChanges.length}）</div>
+              ${componentChanges.length ? componentChanges.map((change) => html`
+                <div class="ledger-row">
+                  <strong>${describeChange(change, component.name)}</strong>
+                  <span class="ledger-meta">r${change.revision} · ${new Date(change.at).toLocaleString('zh-CN')} · ${describeOrigin(change)}</span>
+                  ${change.type === 'keyboard' ? html`<span class="ledger-detail">「${change.oldKeyboard}」→「${change.newKeyboard}」</span>` : nothing}
+                </div>
+              `) : html`<div class="empty">尚无契约改动。属性改名、移除或键盘行为变化会在此留痕。</div>`}
+            </div>
+            <div>
+              <div class="ledger-subhead">本组件的全部引用（${this.allRefs(component.id).length}）</div>
+              ${this.allRefs(component.id).length ? html`<div class="ledger-section">${this.allRefs(component.id).map((ref) => this.renderRefChip(ref))}</div>` : html`<div class="empty">组合示例代码与读屏说明中暂未发现跨组件引用。</div>`}
+            </div>
+          </div>
+        ` : html`<div class="empty">依赖账本缺失，请刷新以重新规整旧数据。</div>`}
+
+        <h3>与最近快照的差异</h3>
+        ${snapshot
+          ? (rows.length ? html`<div class="diff">${rows.map((row) => html`<div class="diff-row"><b>${row.field}</b><span class="before">- ${row.before || '（空）'}</span><br /><span class="after">+ ${row.after || '（空）'}</span></div>`)}</div>` : html`<div class="issue info">当前内容与最近快照一致。</div>`)
+          : html`<div class="empty">保存一次正式版本后即可比较字段、属性和示例变化。</div>`}
       </section>
     `;
   }
@@ -445,6 +585,56 @@ export class SpecA11yWorkbench extends LitElement {
 
   private hasStaleExamples(component: ComponentSpec): boolean {
     return component.examples.some((example) => example.stale);
+  }
+
+  private saveVersion(reason: string) {
+    const result = this.store.createSnapshot(reason);
+    if (result.ok) this.flash('正式版本已保存');
+    else this.flash(result.reason?.split('\n')[0] ?? '待整理项未处理完，不能保存正式版本');
+  }
+
+  private commitRename(propertyId: string) {
+    const draft = this.renameDrafts.get(propertyId);
+    this.renameDrafts.delete(propertyId);
+    if (draft === undefined) return;
+    const current = this.store.selected?.properties.find((property) => property.id === propertyId)?.name;
+    if (current === undefined || draft.trim() === current) return;
+    const result = this.store.renameProperty(propertyId, draft);
+    if (!result.ok && result.reason) this.flash(result.reason);
+    else if (result.ok) this.flash('改名已记入依赖账本，引用已沿链重算');
+  }
+
+  private startRemove(propertyId: string) {
+    this.removingPropertyId = propertyId;
+    this.removingSuccessor = '';
+    this.requestUpdate();
+  }
+
+  private cancelRemove = () => {
+    this.removingPropertyId = '';
+    this.removingSuccessor = '';
+  };
+
+  private refsFor(ownerId: string, exampleId: string): DependencyRef[] {
+    return this.store.state.ledger?.refs.filter((ref) => ref.ownerComponentId === ownerId && ref.scope === 'code' && ref.exampleId === exampleId) ?? [];
+  }
+
+  private allRefs(ownerId: string): DependencyRef[] {
+    return this.store.state.ledger?.refs.filter((ref) => ref.ownerComponentId === ownerId) ?? [];
+  }
+
+  private pendingRefs(ownerId: string): DependencyRef[] {
+    return this.allRefs(ownerId).filter((ref) => isUnresolved(ref));
+  }
+
+  private pendingForComponent(componentId: string): number {
+    return new Set([
+      ...this.store.state.ledger?.refs.filter((ref) => isUnresolved(ref) && (ref.ownerComponentId === componentId || ref.targetComponentId === componentId)).map((ref) => ref.id) ?? []
+    ]).size;
+  }
+
+  private totalPending(): number {
+    return new Set(this.store.state.ledger?.refs.filter((ref) => isUnresolved(ref)).map((ref) => ref.id) ?? []).size;
   }
 
   private statusLabel(status: ComponentSpec['status']): string {

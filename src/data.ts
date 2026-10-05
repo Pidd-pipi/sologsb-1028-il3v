@@ -8,6 +8,7 @@ const components: ComponentSpec[] = [
     name: 'Action button',
     category: 'Actions',
     status: 'published',
+    tagName: 'sp-button',
     purpose: '触发一个明确、可立即完成的动作。',
     usage: '主操作优先使用强调样式；同一区域最多保留一个主按钮。',
     properties: [
@@ -49,6 +50,7 @@ const components: ComponentSpec[] = [
     name: 'Labelled field',
     category: 'Forms',
     status: 'review',
+    tagName: 'sp-textfield',
     purpose: '收集单行文本，并始终向所有用户暴露字段名称。',
     usage: '标签放在输入框上方；帮助文本解释格式，错误文本说明修复方式。',
     properties: [
@@ -81,6 +83,7 @@ const components: ComponentSpec[] = [
     name: 'Modal dialog',
     category: 'Feedback',
     status: 'draft',
+    tagName: 'sp-dialog',
     purpose: '在不离开当前上下文的情况下完成一段有边界的任务。',
     usage: '仅在用户必须处理内容时使用；关闭后恢复触发元素焦点。',
     properties: [
@@ -105,6 +108,38 @@ const components: ComponentSpec[] = [
       }
     ],
     revision: 2,
+    updatedAt: now,
+    snapshots: []
+  },
+  {
+    id: 'task-dialog-spec',
+    name: 'Confirm task dialog',
+    category: 'Feedback',
+    status: 'draft',
+    tagName: 'sp-task-dialog',
+    purpose: '在破坏性操作前要求用户二次确认的任务对话框，组合自 Modal dialog 与 Action button。',
+    usage: '确认按钮使用强调动作样式；不要在其中嵌套第二层任务对话框。',
+    properties: [
+      { id: 'p-td-open', name: 'open', type: 'boolean', required: true, defaultValue: 'false', description: '控制任务对话框可见性。' },
+      { id: 'p-td-heading', name: 'heading', type: 'string', required: true, defaultValue: '确认操作', description: '任务对话框标题。' }
+    ],
+    states: 'closed、open、submitting、error。',
+    keyboardBehavior: 'Esc 关闭；提交进行中禁用全部按钮，Tab 仍在内部循环。',
+    screenReader: '沿用 Modal dialog 的 role=dialog 与 modal 播报；确认完成后播报结果，焦点恢复规则与基础对话框一致。',
+    disabledScenarios: '非破坏性操作不要使用二次确认。',
+    interactionSignature: 'Esc 关闭；submitting 时禁用按钮',
+    examples: [
+      {
+        id: 'example-task-confirm',
+        title: '删除组件二次确认',
+        code: '<sp-task-dialog open heading="删除组件？">\n  <sp-dialog open modal heading="确认删除">\n    <sp-button variant="accent">删除</sp-button>\n  </sp-dialog>\n</sp-task-dialog>',
+        propertyIds: ['p-td-open', 'p-td-heading'],
+        stale: false,
+        staleReason: '',
+        createdFromRevision: 1
+      }
+    ],
+    revision: 1,
     updatedAt: now,
     snapshots: []
   }

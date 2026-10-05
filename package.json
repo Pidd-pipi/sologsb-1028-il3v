@@ -7,6 +7,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "verify:ledger": "esbuild scripts/verify-ledger.mts --bundle --platform=node --format=esm --outfile=node_modules/.cache/verify-ledger.mjs --log-level=warning && node node_modules/.cache/verify-ledger.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
