@@ -28,7 +28,8 @@ const components: ComponentSpec[] = [
         propertyIds: ['p-label', 'p-variant'],
         stale: false,
         staleReason: '',
-        createdFromRevision: 3
+        createdFromRevision: 3,
+        legacyVariants: []
       },
       {
         id: 'example-button-disabled',
@@ -37,12 +38,38 @@ const components: ComponentSpec[] = [
         propertyIds: ['p-label', 'p-disabled'],
         stale: false,
         staleReason: '',
-        createdFromRevision: 3
+        createdFromRevision: 3,
+        legacyVariants: []
       }
     ],
     revision: 3,
     updatedAt: now,
-    snapshots: []
+    snapshots: [],
+    branch: 'main',
+    elementTag: 'sp-button',
+    contractVersion: '3.0.0',
+    ledger: [
+      {
+        // 基础组件改名记录：type 已迁移为 variant；引用旧名 type 的组合示例将沿引用链命中本挂账。
+        id: 'ledger-button-rename-variant',
+        createdAt: now,
+        originComponentId: 'button-spec',
+        kind: 'rename',
+        source: '基础组件属性面板',
+        sourceAction: 'rename-property',
+        branch: 'main',
+        fromRevision: 3,
+        toRevision: 0,
+        fromToken: 'type',
+        toToken: 'variant',
+        propertyId: 'p-variant',
+        breaking: false,
+        reason: '属性 type 改名为 variant，旧引用可自动迁移',
+        refRecordIds: [],
+        proposals: []
+      }
+    ],
+    docLegacyVariants: []
   },
   {
     id: 'field-spec',
@@ -69,12 +96,18 @@ const components: ComponentSpec[] = [
         propertyIds: ['p-field-label', 'p-field-required'],
         stale: false,
         staleReason: '',
-        createdFromRevision: 2
+        createdFromRevision: 2,
+        legacyVariants: []
       }
     ],
     revision: 2,
     updatedAt: now,
-    snapshots: []
+    snapshots: [],
+    branch: 'main',
+    elementTag: 'sp-textfield',
+    contractVersion: '2.0.0',
+    ledger: [],
+    docLegacyVariants: []
   },
   {
     id: 'dialog-spec',
@@ -95,22 +128,31 @@ const components: ComponentSpec[] = [
     interactionSignature: 'Esc 关闭；Tab 焦点循环',
     examples: [
       {
+        // 组合示例：仍引用基础组件 sp-button 的旧属性名 type，复制后会报错——待核对 + 自动迁移演示。
         id: 'example-dialog-modal',
         title: '删除确认',
-        code: '<sp-dialog open modal heading="删除组件？">\n  <sp-button slot="button" variant="negative">删除</sp-button>\n</sp-dialog>',
+        code: '<sp-dialog open modal heading="删除组件？">\n  <sp-button slot="button" type="negative">删除</sp-button>\n</sp-dialog>',
         propertyIds: ['p-dialog-open', 'p-dialog-title', 'p-dialog-modal'],
         stale: true,
         staleReason: '交互签名较上版发生变化，请确认焦点恢复与 Esc 行为。',
-        createdFromRevision: 1
+        createdFromRevision: 1,
+        legacyVariants: []
       }
     ],
     revision: 2,
     updatedAt: now,
-    snapshots: []
+    snapshots: [],
+    branch: 'main',
+    elementTag: 'sp-dialog',
+    contractVersion: '2.0.0',
+    ledger: [],
+    docLegacyVariants: []
   }
 ];
 
 export const createInitialState = (): WorkspaceState => ({
+  ledgerVersion: 1,
   components: structuredClone(components),
+  referenceLedger: { version: 1, records: [] },
   selectedId: components[0].id
 });

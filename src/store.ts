@@ -1,11 +1,39 @@
 import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import {
+  acceptAutoProposalsForOwner,
+  acceptProposal,
+  createExampleRecord,
+  ensureDocRecords,
+  ignoreProposal,
+  ledgerEntriesForOwner,
+  MAIN_BRANCH,
+  migrateLegacyState,
+  pendingProposalsForOwner,
+  publishBlockers,
+  publishSnapshot,
+  reconcile,
+  registerChange,
+  removeRecordsOfExample,
+  renameExampleRecordTitle,
+  reviewRecord,
+  touchDocRecord,
+  touchExampleRecord,
+  uid
+} from './ledger';
+import type {
+  ActionResult,
+  ComponentSpec,
+  DocField,
+  LedgerEntry,
+  MigrationProposal,
+  RefRecord,
+  ValidationIssue,
+  WorkspaceState
+} from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
-const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-const signature = (component: ComponentSpec) => `${component.properties.map((item) => `${item.name}:${item.required}`).join('|')}::${component.interactionSignature}`;
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
@@ -29,7 +57,7 @@ export class SpecStore extends EventTarget {
   select(id: string) {
     if (!this.state.components.some((item) => item.id === id)) return;
     this.state = { ...this.state, selectedId: id };
-    this.persist(false);
+    this.persist();
     this.emit();
   }
 
@@ -51,27 +79,30 @@ export class SpecStore extends EventTarget {
       examples: [],
       revision: 1,
       updatedAt: new Date().toISOString(),
-      snapshots: []
+      snapshots: [],
+      branch: MAIN_BRANCH,
+      elementTag: `sp-component-${id.slice(-4)}`,
+      contractVersion: '1.0.0',
+      ledger: [],
+      docLegacyVariants: []
     };
     this.commit('新建组件', (state) => {
       state.components.unshift(component);
       state.selectedId = id;
+      ensureDocRecords(state, component);
+      reconcile(state);
     });
   }
 
-  updateComponent(patch: Partial<ComponentSpec>, markExamplesStale = false) {
+  /** 普通字段更新；screenReader / 键盘行为 / 交互签名请走专用方法。 */
+  updateComponent(patch: Partial<ComponentSpec>) {
     const selected = this.selected;
     if (!selected) return;
     this.commit('编辑组件', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
       Object.assign(target, patch, { updatedAt: new Date().toISOString() });
-      if (markExamplesStale) {
-        target.examples.forEach((example) => {
-          example.stale = true;
-          example.staleReason = '组件交互或属性契约已修改，示例需要重新验证。';
-        });
-      }
+      reconcile(state);
     });
   }
 
@@ -79,7 +110,9 @@ export class SpecStore extends EventTarget {
     const selected = this.selected;
     if (!selected) return;
     this.commit('新增属性', (state) => {
-      state.components.find((item) => item.id === selected.id)?.properties.push({
+      const target = state.components.find((item) => item.id === selected.id);
+      if (!target) return;
+      target.properties.push({
         id: uid('property'),
         name: 'newProperty',
         type: 'string',
@@ -87,6 +120,7 @@ export class SpecStore extends EventTarget {
         defaultValue: '',
         description: '描述该属性对开发者和用户的影响。'
       });
+      reconcile(state);
     });
   }
 
@@ -96,7 +130,23 @@ export class SpecStore extends EventTarget {
     this.commit('编辑属性', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       const property = target?.properties.find((item) => item.id === propertyId);
-      if (target && property) Object.assign(property, patch);
+      if (!target || !property) return;
+      const oldName = property.name;
+      Object.assign(property, patch);
+      if (patch.name !== undefined && patch.name.trim() !== '' && patch.name !== oldName) {
+        // 属性改名：记契约版本/来源，沿引用链立即失效，可映射引用出自动迁移草案。
+        registerChange(state, target, {
+          kind: 'rename',
+          source: '属性面板编辑',
+          sourceAction: 'rename-property',
+          fromToken: oldName,
+          toToken: patch.name,
+          propertyId,
+          reason: `属性 ${oldName} 改名为 ${patch.name}`
+        });
+      } else {
+        reconcile(state);
+      }
     });
   }
 
@@ -107,12 +157,15 @@ export class SpecStore extends EventTarget {
       const target = state.components.find((item) => item.id === selected.id);
       const property = target?.properties.find((item) => item.id === propertyId);
       if (!target || !property) return;
+      const oldName = property.name;
       target.properties = target.properties.filter((item) => item.id !== propertyId);
-      target.examples.forEach((example) => {
-        if (example.propertyIds.includes(propertyId) || example.code.includes(property.name)) {
-          example.stale = true;
-          example.staleReason = `属性 ${property.name} 已删除，示例代码或说明仍可能引用它。`;
-        }
+      registerChange(state, target, {
+        kind: 'remove',
+        source: '属性面板编辑',
+        sourceAction: 'remove-property',
+        fromToken: oldName,
+        propertyId,
+        reason: `属性 ${oldName} 被移除`
       });
     });
   }
@@ -127,12 +180,16 @@ export class SpecStore extends EventTarget {
       target.examples.push({
         id: exampleId,
         title: '新示例',
-        code: `<${target.name.toLowerCase().replaceAll(' ', '-')}>示例</${target.name.toLowerCase().replaceAll(' ', '-')}>`,
+        code: `<${target.elementTag}>示例</${target.elementTag}>`,
         propertyIds: [],
         stale: false,
         staleReason: '',
-        createdFromRevision: target.revision
+        createdFromRevision: target.revision,
+        needsReview: false,
+        reviewNote: '',
+        legacyVariants: []
       });
+      createExampleRecord(state, target, exampleId, '新示例');
     });
   }
 
@@ -142,7 +199,10 @@ export class SpecStore extends EventTarget {
     this.commit('编辑示例', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       const example = target?.examples.find((item) => item.id === exampleId);
-      if (example) Object.assign(example, patch);
+      if (!target || !example) return;
+      Object.assign(example, patch);
+      if (patch.title !== undefined) renameExampleRecordTitle(state, exampleId, patch.title);
+      touchExampleRecord(state, exampleId);
     });
   }
 
@@ -151,49 +211,114 @@ export class SpecStore extends EventTarget {
     if (!selected) return;
     this.commit('删除示例', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
-      if (target) target.examples = target.examples.filter((item) => item.id !== exampleId);
+      if (!target) return;
+      target.examples = target.examples.filter((item) => item.id !== exampleId);
+      removeRecordsOfExample(state, exampleId);
+      reconcile(state);
     });
   }
 
-  createSnapshot(reason = '手动版本') {
+  /** 键盘行为说明编辑（文档本体）；交互签名变化则记键盘契约变更。 */
+  updateKeyboardContract(patch: { keyboardBehavior?: string; interactionSignature?: string }) {
     const selected = this.selected;
     if (!selected) return;
-    this.commit('创建版本快照', (state) => {
+    this.commit('编辑键盘契约', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
-      const { snapshots: _ignored, ...component } = clone(target);
-      const nextRevision = target.revision + 1;
-      const snapshot: ComponentSnapshot = {
-        revision: target.revision,
-        savedAt: new Date().toISOString(),
-        reason,
-        component: { ...component, revision: target.revision }
-      };
-      target.snapshots.unshift(snapshot);
-      target.snapshots = target.snapshots.slice(0, 12);
-      target.revision = nextRevision;
+      if (patch.keyboardBehavior !== undefined && patch.keyboardBehavior !== target.keyboardBehavior) {
+        target.keyboardBehavior = patch.keyboardBehavior;
+        touchDocRecord(state, target, 'keyboardBehavior');
+      }
+      if (patch.interactionSignature !== undefined && patch.interactionSignature.trim() !== target.interactionSignature.trim()) {
+        target.interactionSignature = patch.interactionSignature;
+        registerChange(state, target, {
+          kind: 'keyboard',
+          source: '交互签名编辑',
+          sourceAction: 'edit-interaction-signature',
+          reason: `键盘行为/交互签名发生变化：${target.interactionSignature.trim() || '（空）'}`
+        });
+      }
       target.updatedAt = new Date().toISOString();
     });
   }
 
-  migrateExamples() {
+  /** 读屏说明编辑：本身也是沿引用链被追踪的文档。 */
+  updateScreenReader(text: string) {
     const selected = this.selected;
     if (!selected) return;
-    this.commit('迁移示例到当前版本', (state) => {
+    this.commit('编辑读屏说明', (state) => {
       const target = state.components.find((item) => item.id === selected.id);
       if (!target) return;
-      const currentSignature = signature(target);
-      const activePropertyIds = new Set(target.properties.map((item) => item.id));
-      target.examples.forEach((example) => {
-        example.propertyIds = example.propertyIds.filter((id) => activePropertyIds.has(id));
-        example.stale = false;
-        example.staleReason = '';
-        example.createdFromRevision = target.revision;
+      target.screenReader = text;
+      touchDocRecord(state, target, 'screenReader');
+      target.updatedAt = new Date().toISOString();
+    });
+  }
+
+  /** 分支改名：版本不兼容，旧引用并列保留为 legacy 变体。 */
+  renameBranch(nextBranch: string): ActionResult {
+    const selected = this.selected;
+    if (!selected) return { ok: false, reason: '未选择组件。' };
+    const branch = nextBranch.trim();
+    if (!branch || branch === selected.branch) return { ok: false, reason: '分支名未变化。' };
+    this.commit('契约分支改名', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      if (!target) return;
+      registerChange(state, target, {
+        kind: 'branch',
+        source: '分支管理',
+        sourceAction: 'rename-branch',
+        fromToken: target.branch,
+        toToken: branch,
+        reason: `契约分支 ${target.branch} → ${branch}（版本不兼容，并列保留）`
       });
-      target.interactionSignature = currentSignature.split('::')[1] ?? target.interactionSignature;
-      target.revision += 1;
-      target.updatedAt = new Date().toISOString();
+      target.branch = branch;
+      reconcile(state);
     });
+    return { ok: true };
+  }
+
+  reviewRef(recordId: string, verified: boolean) {
+    const selected = this.selected;
+    if (!selected) return;
+    this.commit('核对引用关系', (state) => {
+      reviewRecord(state, recordId, verified);
+    });
+  }
+
+  acceptProposal(proposalId: string) {
+    this.commit('选定迁移提案', (state) => acceptProposal(state, proposalId));
+  }
+
+  ignoreProposal(proposalId: string) {
+    this.commit('搁置迁移提案', (state) => ignoreProposal(state, proposalId));
+  }
+
+  acceptAllAutoMigrations(componentId?: string): number {
+    const id = componentId ?? this.selected?.id;
+    if (!id) return 0;
+    let count = 0;
+    this.commit('全部接受自动迁移', (state) => {
+      count = acceptAutoProposalsForOwner(state, id);
+    });
+    return count;
+  }
+
+  /** 正式保存（创建快照）：待整理项未处理完一律拒绝。 */
+  publishVersion(reason = '手动版本'): ActionResult {
+    const selected = this.selected;
+    if (!selected) return { ok: false, reason: '未选择组件。' };
+    let result: ActionResult = { ok: true };
+    this.commit('保存正式版本', (state) => {
+      const target = state.components.find((item) => item.id === selected.id);
+      if (!target) return;
+      const published = publishSnapshot(state, target, reason);
+      if (!published.ok) {
+        result = { ok: false, reason: published.blockers?.[0]?.message ?? '存在未处理的待整理项。' };
+        throw new ROLLBACK();
+      }
+    });
+    return result;
   }
 
   validate(): ValidationIssue[] {
@@ -206,12 +331,7 @@ export class SpecStore extends EventTarget {
           issues.push({ id: `${component.id}-duplicate-${name}`, level: 'error', componentId: component.id, target: component.name, message: `属性名称 ${name} 重复。`, field: 'properties' });
         }
       }
-      const contractChanged = component.examples.some((example) => example.createdFromRevision < component.revision);
       component.examples.forEach((example) => {
-        const missingReferences = example.propertyIds.filter((id) => !component.properties.some((property) => property.id === id));
-        if (example.stale || missingReferences.length) {
-          issues.push({ id: `${component.id}-${example.id}-stale`, level: 'warning', componentId: component.id, target: example.title, message: example.staleReason || '示例引用了已删除属性。', field: 'examples' });
-        }
         if (!example.code.trim()) {
           issues.push({ id: `${component.id}-${example.id}-empty`, level: 'error', componentId: component.id, target: example.title, message: '示例代码不能为空。', field: 'examples' });
         }
@@ -222,11 +342,36 @@ export class SpecStore extends EventTarget {
       if (!component.screenReader.trim()) {
         issues.push({ id: `${component.id}-screenreader`, level: 'error', componentId: component.id, target: component.name, message: '缺少读屏说明。', field: 'screenReader' });
       }
-      if (contractChanged && component.examples.length) {
-        issues.push({ id: `${component.id}-contract`, level: 'info', componentId: component.id, target: component.name, message: '属性契约或交互签名发生变化，建议创建快照并迁移示例。', field: 'properties' });
-      }
+    }
+    for (const blocker of publishBlockers(this.state)) {
+      issues.push({
+        id: `blocker-${blocker.kind}-${blocker.message}`,
+        level: 'error',
+        componentId: blocker.componentId,
+        target: this.state.components.find((item) => item.id === blocker.componentId)?.name ?? '契约账本',
+        message: blocker.message,
+        field: 'ledger'
+      });
     }
     return issues;
+  }
+
+  getRecordForExample(exampleId: string): RefRecord | undefined {
+    return this.state.referenceLedger.records.find((record) => record.exampleId === exampleId);
+  }
+
+  getDocRecord(componentId: string, field: DocField): RefRecord | undefined {
+    return this.state.referenceLedger.records.find(
+      (record) => record.ownerComponentId === componentId && record.kind === 'doc' && record.docField === field
+    );
+  }
+
+  getProposals(componentId: string): { entry: LedgerEntry; proposal: MigrationProposal }[] {
+    return pendingProposalsForOwner(this.state, componentId);
+  }
+
+  getLedgerEntries(componentId: string): LedgerEntry[] {
+    return ledgerEntriesForOwner(this.state, componentId);
   }
 
   undo() {
@@ -234,7 +379,7 @@ export class SpecStore extends EventTarget {
     if (!previous) return;
     this.redoStack.push(clone(this.state));
     this.state = previous;
-    this.persist(false);
+    this.persist();
     this.emit();
   }
 
@@ -243,22 +388,31 @@ export class SpecStore extends EventTarget {
     if (!next) return;
     this.undoStack.push(clone(this.state));
     this.state = next;
-    this.persist(false);
+    this.persist();
     this.emit();
   }
 
   reset() {
     this.undoStack = [];
     this.redoStack = [];
-    this.state = createInitialState();
-    this.persist(false);
+    this.state = migrateLegacyState(createInitialState());
+    this.persist();
     this.emit();
   }
 
   private commit(label: string, mutator: (state: WorkspaceState) => void) {
     const before = clone(this.state);
     const next = clone(this.state);
-    mutator(next);
+    try {
+      mutator(next);
+    } catch (error) {
+      if (error instanceof ROLLBACK) {
+        this.lastAction = `${label}（已拦截）`;
+        this.emit();
+        return;
+      }
+      throw error;
+    }
     this.undoStack.push(before);
     this.undoStack = this.undoStack.slice(-40);
     this.redoStack = [];
@@ -271,14 +425,17 @@ export class SpecStore extends EventTarget {
   private load(): WorkspaceState {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved) as WorkspaceState;
+      if (saved) {
+        const parsed = JSON.parse(saved) as WorkspaceState;
+        if (parsed && Array.isArray(parsed.components)) return migrateLegacyState(parsed);
+      }
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
     }
-    return createInitialState();
+    return migrateLegacyState(createInitialState());
   }
 
-  private persist(_notify = true) {
+  private persist() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
   }
 
@@ -286,3 +443,6 @@ export class SpecStore extends EventTarget {
     this.dispatchEvent(new CustomEvent('change'));
   }
 }
+
+/** mutator 内部用于“校验不通过、整笔不落账”的控制信号。 */
+class ROLLBACK extends Error {}
